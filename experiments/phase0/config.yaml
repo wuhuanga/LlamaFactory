@@ -1,0 +1,62 @@
+# ============================================================
+# Phase 0: SFT 遗忘基线验证实验 - 统一配置
+# ============================================================
+
+# --- 路径 ---
+paths:
+  base_model: "/data1/guest/LlamaFactory/models/Llama-3.1-8B"
+  output_model: "/data1/guest/LlamaFactory/experiments/phase0/sft_model"
+  output_dir: "/data1/guest/LlamaFactory/experiments/phase0/outputs"
+  cache_dir: "/data1/guest/LlamaFactory/experiments/phase0/cache"
+
+# --- 数据 ---
+data:
+  dataset: "openlifescienceai/medmcqa"
+  train_samples: null          # null = 使用完整训练集
+  seed: 42
+
+# --- 训练超参 ---
+training:
+  method: "full"            # full fine-tuning, 不用 LoRA
+  epochs: 3
+  learning_rate: 2.0e-5
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.03
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch size = 4 * 4 * 2卡 = 32
+  max_seq_length: 1024
+  bf16: true
+  optimizer: "adamw_torch"
+  seed: 42
+  logging_steps: 50
+  save_strategy: "epoch"
+
+# --- 评测 ---
+eval:
+  num_fewshot: 0
+  batch_size: "auto"
+  tasks:
+    - name: "medmcqa"
+      layer: "ID"
+    - name: "mmlu"
+      layer: "OOD_subject"
+      # 需排除的 medical 子类（汇总时处理）
+      medical_subcategories:
+        - "clinical_knowledge"
+        - "college_medicine"
+        - "professional_medicine"
+        - "medical_genetics"
+        - "anatomy"
+    - name: "popqa"
+      layer: "OOD_facts"
+    - name: "triviaqa"
+      layer: "OOD_facts"
+    - name: "truthfulqa_mc2"
+      layer: "OOD_hallucination"
+    - name: "truthfulqa_mc1"
+      layer: "OOD_hallucination"
+    - name: "inverse_scaling_memo_trap"
+      layer: "OOD_hallucination"
+
+# --- GPU ---
+gpu: "1,3"

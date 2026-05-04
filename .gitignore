@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.safetensors
 # Distribution / packaging
 .Python
 build/
@@ -74,6 +74,16 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+*.mv
+*.msc
+*.bin
+*.json
+cache*
+*data*
+*.jsonl
+*.pth
+*.png
+
 
 # Jupyter Notebook
 .ipynb_checkpoints

@@ -524,6 +524,30 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "The alpha parameter for EAFT loss to control the power of adaptive weight."},
     )
+    use_ood_kp_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use OOD knowledge preservation loss via self-distillation on a separate KP dataset."},
+    )
+    ood_kp_alpha: float = field(
+        default=1.0,
+        metadata={"help": "Weight for the OOD knowledge preservation KL loss."},
+    )
+    ood_kp_data_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to the KP prompts JSONL file (each line: {\"prompt\": \"...\"})."},
+    )
+    ood_kp_gen_max_new_tokens: int = field(
+        default=128,
+        metadata={"help": "Max new tokens for on-policy student generation on KP prompts."},
+    )
+    ood_kp_gen_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Temperature for student generation on KP prompts."},
+    )
+    ood_kp_gen_top_p: float = field(
+        default=0.95,
+        metadata={"help": "Top-p for student generation on KP prompts."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -572,6 +596,9 @@ class FinetuningArguments(
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
+
+        if self.use_ood_kp_loss and self.ood_kp_data_path is None:
+            raise ValueError("`ood_kp_data_path` is required when `use_ood_kp_loss` is True.")
 
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."

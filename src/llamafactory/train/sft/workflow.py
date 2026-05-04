@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
@@ -26,7 +27,7 @@ from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push, create_ref_model
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
-from .trainer import CustomSeq2SeqTrainer
+from .trainer import CustomSeq2SeqTrainer, KPPromptDataset
 
 
 if TYPE_CHECKING:
@@ -53,8 +54,26 @@ def run_sft(
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     ref_model = None
-    if finetuning_args.use_asft_loss:
+    kp_dataset = None
+    if finetuning_args.use_asft_loss or finetuning_args.use_ood_kp_loss:
         ref_model = create_ref_model(model_args, finetuning_args)
+
+    if finetuning_args.use_ood_kp_loss and finetuning_args.ood_kp_data_path is not None:
+        logger.info_rank0(f"Loading KP prompts from {finetuning_args.ood_kp_data_path}")
+        prompts = []
+        with open(finetuning_args.ood_kp_data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    prompts.append(json.loads(line)["prompt"])
+        logger.info_rank0(f"Loaded {len(prompts)} KP prompts, tokenizing...")
+        input_ids_list, attention_mask_list = [], []
+        for p in prompts:
+            enc = tokenizer(p, truncation=True, max_length=64, padding=False, return_attention_mask=True)
+            input_ids_list.append(enc["input_ids"])
+            attention_mask_list.append(enc["attention_mask"])
+        kp_dataset = KPPromptDataset(input_ids_list, attention_mask_list)
+        logger.info_rank0(f"KP dataset ready: {len(kp_dataset)} prompts")
 
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
@@ -130,6 +149,7 @@ def run_sft(
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
             ref_model=ref_model,
+            kp_dataset=kp_dataset,
             **dataset_module,
             **tokenizer_module,
             **metric_module,
@@ -149,6 +169,8 @@ def run_sft(
         trainer.save_state()
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
             keys = ["loss"]
+            if finetuning_args.use_ood_kp_loss:
+                keys += ["l_sft", "l_kp"]
             if isinstance(dataset_module.get("eval_dataset"), dict):
                 keys += sum(
                     [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []

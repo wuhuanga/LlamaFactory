@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -34,11 +36,42 @@ from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
 if TYPE_CHECKING:
-    from torch.utils.data import Dataset
+    from torch.utils.data import Dataset as DatasetType
     from transformers import ProcessorMixin
     from transformers.trainer import PredictionOutput
 
     from ...hparams import FinetuningArguments, ModelArguments, TrainingArguments
+
+
+class KPPromptDataset(Dataset):
+    """Simple dataset holding pre-tokenized KP prompts for OOD knowledge preservation."""
+
+    def __init__(self, input_ids_list: list[list[int]], attention_mask_list: list[list[int]]):
+        self.input_ids_list = input_ids_list
+        self.attention_mask_list = attention_mask_list
+
+    def __len__(self):
+        return len(self.input_ids_list)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids_list[idx],
+            "attention_mask": self.attention_mask_list[idx],
+        }
+
+
+def _kp_collate_fn(batch: list[dict], pad_token_id: int) -> dict[str, torch.Tensor]:
+    """Left-pad KP prompts for generation (shorter prompts get padding on the left)."""
+    max_len = max(len(x["input_ids"]) for x in batch)
+    input_ids, attention_mask = [], []
+    for x in batch:
+        pad_len = max_len - len(x["input_ids"])
+        input_ids.append([pad_token_id] * pad_len + x["input_ids"])
+        attention_mask.append([0] * pad_len + x["attention_mask"])
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+    }
 
 
 logger = logging.get_logger(__name__)
@@ -54,6 +87,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
         ref_model: Optional["torch.nn.Module"] = None,
+        kp_dataset: Optional["KPPromptDataset"] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
@@ -124,6 +158,37 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 asft_alpha=finetuning_args.asft_alpha,
             )
 
+        # --- OOD Knowledge Preservation (KP) setup ---
+        self._kp_dataloader = None
+        self._kp_iter = None
+        self._kp_loss_sum = 0.0
+        self._sft_loss_sum = 0.0
+        self._kp_count = 0
+
+        if finetuning_args.use_ood_kp_loss and kp_dataset is not None:
+            pad_token_id = getattr(self.processing_class, "pad_token_id", 0) or 0
+
+            from torch.utils.data.distributed import DistributedSampler
+
+            if self.args.world_size > 1:
+                kp_sampler = DistributedSampler(
+                    kp_dataset,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    shuffle=True,
+                )
+            else:
+                kp_sampler = RandomSampler(kp_dataset)
+
+            self._kp_dataloader = DataLoader(
+                kp_dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                sampler=kp_sampler,
+                collate_fn=partial(_kp_collate_fn, pad_token_id=pad_token_id),
+                drop_last=True,
+            )
+            self._kp_iter = iter(self._kp_dataloader)
+
         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
             verify_fp8_status(self.accelerator, training_args)
 
@@ -147,9 +212,110 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return super()._get_train_sampler(*args, **kwargs)
 
+    def _get_kp_batch(self) -> dict[str, torch.Tensor]:
+        """Get next batch from the cycling KP dataloader."""
+        try:
+            batch = next(self._kp_iter)
+        except StopIteration:
+            self._kp_iter = iter(self._kp_dataloader)
+            batch = next(self._kp_iter)
+        return batch
+
+    def _compute_kp_loss(self, model) -> torch.Tensor:
+        """Compute the OOD knowledge preservation loss via on-policy self-distillation."""
+        kp_batch = self._get_kp_batch()
+        device = next(model.parameters()).device
+        kp_input_ids = kp_batch["input_ids"].to(device)
+        kp_attention_mask = kp_batch["attention_mask"].to(device)
+        prompt_len = kp_input_ids.size(1)
+
+        # Step 1: Student on-policy generation (no grad)
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            gen_output = model.generate(
+                input_ids=kp_input_ids,
+                attention_mask=kp_attention_mask,
+                max_new_tokens=self.finetuning_args.ood_kp_gen_max_new_tokens,
+                temperature=self.finetuning_args.ood_kp_gen_temperature,
+                top_p=self.finetuning_args.ood_kp_gen_top_p,
+                do_sample=True,
+                pad_token_id=self.processing_class.pad_token_id,
+            )
+        if was_training:
+            model.train()
+
+        # full_seq = [prompt ; y_gen], shape: [batch, prompt_len + gen_len]
+        full_seq = gen_output
+        full_attention_mask = (full_seq != self.processing_class.pad_token_id).long()
+
+        # gen_mask: 1 for generated token positions, 0 for prompt / padding
+        gen_mask = torch.zeros_like(full_seq, dtype=torch.float)
+        gen_mask[:, prompt_len:] = 1.0
+        gen_mask = gen_mask * full_attention_mask.float()
+
+        if gen_mask.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Step 2: Teacher forward (no grad)
+        with torch.no_grad():
+            teacher_outputs = self.ref_model(
+                input_ids=full_seq,
+                attention_mask=full_attention_mask,
+            )
+            teacher_logits = teacher_outputs.logits.float()
+
+        # Step 3: Student forward (with grad)
+        student_outputs = model(
+            input_ids=full_seq,
+            attention_mask=full_attention_mask,
+        )
+        student_logits = student_outputs.logits.float()
+
+        # Step 4: Forward KL on generated tokens (causal LM shift)
+        # logits[:, t] predicts token[:, t+1], so shift accordingly
+        shift_student_logits = student_logits[:, :-1, :].contiguous()
+        shift_teacher_logits = teacher_logits[:, :-1, :].contiguous()
+        shift_gen_mask = gen_mask[:, 1:].contiguous()  # align with predicted tokens
+
+        # Forward KL: KL(student || teacher) = sum student * (log_student - log_teacher)
+        student_logprobs = F.log_softmax(shift_student_logits, dim=-1)
+        teacher_logprobs = F.log_softmax(shift_teacher_logits, dim=-1)
+
+        # F.kl_div(input=teacher_logprobs, target=student_logprobs, log_target=True)
+        #   = exp(student_logprobs) * (student_logprobs - teacher_logprobs)
+        #   = KL(student || teacher) per element
+        kl_per_token = F.kl_div(
+            teacher_logprobs,
+            student_logprobs,
+            reduction="none",
+            log_target=True,
+        ).sum(dim=-1)  # [batch, seq_len-1]
+
+        l_kp = (kl_per_token * shift_gen_mask).sum() / shift_gen_mask.sum()
+        return l_kp
+
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        if self.finetuning_args.use_asft_loss:
+        if self.finetuning_args.use_ood_kp_loss:
+            # L_SFT: standard cross-entropy on SFT data
+            outputs = model(**inputs)
+            l_sft = outputs.loss
+
+            # L_KP: on-policy self-distillation KL on KP data
+            l_kp = self._compute_kp_loss(model)
+
+            # Total loss
+            alpha = self.finetuning_args.ood_kp_alpha
+            loss = l_sft + alpha * l_kp
+
+            # Accumulate for logging
+            self._sft_loss_sum += l_sft.detach().item()
+            self._kp_loss_sum += l_kp.detach().item()
+            self._kp_count += 1
+
+            return loss
+        elif self.finetuning_args.use_asft_loss:
             with torch.no_grad():
                 ref_outputs = self.ref_model(
                     input_ids=inputs["input_ids"],
@@ -160,6 +326,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
         else:
             return super().compute_loss(model, inputs, *args, **kwargs)
+
+    @override
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        if self._kp_count > 0:
+            logs["l_sft"] = round(self._sft_loss_sum / self._kp_count, 6)
+            logs["l_kp"] = round(self._kp_loss_sum / self._kp_count, 6)
+            self._sft_loss_sum = 0.0
+            self._kp_loss_sum = 0.0
+            self._kp_count = 0
+        super().log(logs, *args, **kwargs)
 
     @override
     def prediction_step(

@@ -1,0 +1,36 @@
+### model
+model_name_or_path: /data1/guest/LlamaFactory/models/Llama-3.1-8B
+
+### method - Standard SFT baseline (G2, same hyperparams as KP variant)
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json
+
+### dataset
+dataset: medmcqa_sft
+template: empty
+cutoff_len: 1024
+preprocessing_num_workers: 8
+
+### output
+output_dir: /data1/guest/LlamaFactory/experiments/phase1/sft_baseline_model
+logging_steps: 50
+save_strategy: epoch
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train (same hyperparams as sft_kp.yaml for fair comparison)
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+optim: adamw_torch
+seed: 42
+ddp_timeout: 180000000
+gradient_checkpointing: true

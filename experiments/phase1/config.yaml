@@ -1,0 +1,47 @@
+# ============================================================
+# Phase 1: OOD-Aware Self-Distillation 可行性验证
+# ============================================================
+
+# --- 路径 ---
+paths:
+  base_model: "/data1/guest/LlamaFactory/models/Llama-3.1-8B"
+  # G2: Standard SFT baseline (重训，同超参)
+  baseline_model: "/data1/guest/LlamaFactory/experiments/phase1/sft_baseline_model"
+  # G3: SFT + L_KP
+  kp_model: "/data1/guest/LlamaFactory/experiments/phase1/sft_kp_model"
+  output_dir: "/data1/guest/LlamaFactory/experiments/phase1/outputs"
+  cache_dir: "/data1/guest/LlamaFactory/experiments/phase1/cache"
+
+# --- 评测 ---
+eval:
+  num_fewshot: 0
+  batch_size: "auto"
+  tasks:
+    - name: "medmcqa"
+      layer: "ID"
+    - name: "mmlu"
+      layer: "OOD_subject"
+      medical_subcategories:
+        - "clinical_knowledge"
+        - "college_medicine"
+        - "professional_medicine"
+        - "medical_genetics"
+        - "anatomy"
+    - name: "popqa"
+      layer: "OOD_facts"
+    - name: "triviaqa"
+      layer: "OOD_facts"
+    - name: "truthfulqa_mc2"
+      layer: "OOD_hallucination"
+    - name: "truthfulqa_mc1"
+      layer: "OOD_hallucination"
+
+# --- Phase 1 判定标准 ---
+# PopQA >= 0.10, TriviaQA >= 0.55, MedMCQA 不掉超过 0.01
+criteria:
+  popqa_min: 0.10
+  triviaqa_min: 0.55
+  medmcqa_max_drop: 0.01
+
+# --- GPU ---
+gpu: "2,3"

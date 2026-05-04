@@ -2,6 +2,9 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "medmcqa_sft": {
+    "file_name": "medmcqa_sft.json"
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },
