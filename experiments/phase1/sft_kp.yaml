@@ -39,9 +39,11 @@ gradient_checkpointing: true
 use_ood_kp_loss: true
 ood_kp_alpha: 1.0
 ood_kp_data_path: /data1/guest/LlamaFactory/data/dkp_wiki_10k.jsonl
-ood_kp_gen_max_new_tokens: 128
+ood_kp_gen_max_new_tokens: 32
+ood_kp_every_n_steps: 8
 ood_kp_gen_temperature: 1.0
 ood_kp_gen_top_p: 0.95
 
-### Teacher model: 4-bit quantization to save VRAM
+### Teacher model: explicit path + 4-bit quantization to save VRAM
+ref_model: /data1/guest/LlamaFactory/models/Llama-3.1-8B
 ref_model_quantization_bit: 4
