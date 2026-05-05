@@ -548,6 +548,10 @@ class FinetuningArguments(
         default=0.95,
         metadata={"help": "Top-p for student generation on KP prompts."},
     )
+    ood_kp_every_n_steps: int = field(
+        default=8,
+        metadata={"help": "Compute KP loss every N training steps (to amortize generation cost). Default: every gradient accumulation cycle."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

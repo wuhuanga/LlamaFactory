@@ -164,6 +164,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._kp_loss_sum = 0.0
         self._sft_loss_sum = 0.0
         self._kp_count = 0
+        self._kp_step_counter = 0
 
         if finetuning_args.use_ood_kp_loss and kp_dataset is not None:
             pad_token_id = getattr(self.processing_class, "pad_token_id", 0) or 0
@@ -217,6 +218,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         try:
             batch = next(self._kp_iter)
         except StopIteration:
+            # Update epoch for DistributedSampler so shuffle differs each cycle
+            self._kp_epoch = getattr(self, "_kp_epoch", 0) + 1
+            if hasattr(self._kp_dataloader.sampler, "set_epoch"):
+                self._kp_dataloader.sampler.set_epoch(self._kp_epoch)
             self._kp_iter = iter(self._kp_dataloader)
             batch = next(self._kp_iter)
         return batch
@@ -224,16 +229,27 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def _compute_kp_loss(self, model) -> torch.Tensor:
         """Compute the OOD knowledge preservation loss via on-policy self-distillation."""
         kp_batch = self._get_kp_batch()
-        device = next(model.parameters()).device
+        # Use the device from inputs (works for both ZeRO-2 and ZeRO-3)
+        device = self.args.device
         kp_input_ids = kp_batch["input_ids"].to(device)
         kp_attention_mask = kp_batch["attention_mask"].to(device)
         prompt_len = kp_input_ids.size(1)
 
         # Step 1: Student on-policy generation (no grad)
+        # Temporarily enable KV cache and disable gradient checkpointing for fast generation
+        # Under DeepSpeed, model.config is the DS config dict; use unwrapped model for HF config
+        unwrapped = self.accelerator.unwrap_model(model)
         was_training = model.training
+        prev_use_cache = getattr(unwrapped.config, "use_cache", False)
+        prev_gc = getattr(unwrapped, "is_gradient_checkpointing", False)
+
+        unwrapped.config.use_cache = True
+        if prev_gc and hasattr(unwrapped, "gradient_checkpointing_disable"):
+            unwrapped.gradient_checkpointing_disable()
         model.eval()
+
         with torch.no_grad():
-            gen_output = model.generate(
+            gen_output = unwrapped.generate(
                 input_ids=kp_input_ids,
                 attention_mask=kp_attention_mask,
                 max_new_tokens=self.finetuning_args.ood_kp_gen_max_new_tokens,
@@ -242,8 +258,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 do_sample=True,
                 pad_token_id=self.processing_class.pad_token_id,
             )
+
+        # Restore training state
         if was_training:
             model.train()
+        unwrapped.config.use_cache = prev_use_cache
+        if prev_gc and hasattr(unwrapped, "gradient_checkpointing_enable"):
+            unwrapped.gradient_checkpointing_enable()
 
         # full_seq = [prompt ; y_gen], shape: [batch, prompt_len + gen_len]
         full_seq = gen_output
@@ -303,7 +324,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             l_sft = outputs.loss
 
             # L_KP: on-policy self-distillation KL on KP data
-            l_kp = self._compute_kp_loss(model)
+            # Only compute every N steps to amortize expensive generation cost
+            every_n = self.finetuning_args.ood_kp_every_n_steps
+            self._kp_step_counter += 1
+            if self._kp_step_counter % every_n == 0:
+                l_kp = self._compute_kp_loss(model)
+            else:
+                l_kp = torch.tensor(0.0, device=l_sft.device)
 
             # Total loss
             alpha = self.finetuning_args.ood_kp_alpha
