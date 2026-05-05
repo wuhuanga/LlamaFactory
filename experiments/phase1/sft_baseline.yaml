@@ -5,7 +5,7 @@ model_name_or_path: /data1/guest/LlamaFactory/models/Llama-3.1-8B
 stage: sft
 do_train: true
 finetuning_type: full
-deepspeed: examples/deepspeed/ds_z3_config.json
+deepspeed: examples/deepspeed/ds_z2_config.json
 
 ### dataset
 dataset: medmcqa_sft

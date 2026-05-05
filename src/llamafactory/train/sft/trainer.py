@@ -314,6 +314,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         ).sum(dim=-1)  # [batch, seq_len-1]
 
         l_kp = (kl_per_token * shift_gen_mask).sum() / shift_gen_mask.sum()
+        # Compensate for computing KP loss only every N steps:
+        # effective gradient contribution = α * l_kp / N without this, so multiply by N
+        l_kp = l_kp * float(self.finetuning_args.ood_kp_every_n_steps)
         return l_kp
 
     @override
