@@ -44,11 +44,17 @@ if TYPE_CHECKING:
 
 
 class KPPromptDataset(Dataset):
-    """Simple dataset holding pre-tokenized KP prompts for OOD knowledge preservation."""
+    """Pre-tokenized (prompt + continuation) sequences with gen_mask for OOD KP."""
 
-    def __init__(self, input_ids_list: list[list[int]], attention_mask_list: list[list[int]]):
+    def __init__(
+        self,
+        input_ids_list: list[list[int]],
+        attention_mask_list: list[list[int]],
+        gen_mask_list: list[list[int]],
+    ):
         self.input_ids_list = input_ids_list
         self.attention_mask_list = attention_mask_list
+        self.gen_mask_list = gen_mask_list
 
     def __len__(self):
         return len(self.input_ids_list)
@@ -57,20 +63,23 @@ class KPPromptDataset(Dataset):
         return {
             "input_ids": self.input_ids_list[idx],
             "attention_mask": self.attention_mask_list[idx],
+            "gen_mask": self.gen_mask_list[idx],
         }
 
 
 def _kp_collate_fn(batch: list[dict], pad_token_id: int) -> dict[str, torch.Tensor]:
-    """Left-pad KP prompts for generation (shorter prompts get padding on the left)."""
+    """Right-pad full (prompt + continuation) sequences for forward-only KP."""
     max_len = max(len(x["input_ids"]) for x in batch)
-    input_ids, attention_mask = [], []
+    input_ids, attention_mask, gen_mask = [], [], []
     for x in batch:
         pad_len = max_len - len(x["input_ids"])
-        input_ids.append([pad_token_id] * pad_len + x["input_ids"])
-        attention_mask.append([0] * pad_len + x["attention_mask"])
+        input_ids.append(x["input_ids"] + [pad_token_id] * pad_len)
+        attention_mask.append(x["attention_mask"] + [0] * pad_len)
+        gen_mask.append(x["gen_mask"] + [0] * pad_len)
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "gen_mask": torch.tensor(gen_mask, dtype=torch.long),
     }
 
 
@@ -227,95 +236,45 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return batch
 
     def _compute_kp_loss(self, model) -> torch.Tensor:
-        """Compute the OOD knowledge preservation loss via on-policy self-distillation."""
+        """Off-policy self-distillation KL on Wikipedia continuations."""
         kp_batch = self._get_kp_batch()
-        # Use the device from inputs (works for both ZeRO-2 and ZeRO-3)
         device = self.args.device
-        kp_input_ids = kp_batch["input_ids"].to(device)
-        kp_attention_mask = kp_batch["attention_mask"].to(device)
-        prompt_len = kp_input_ids.size(1)
-
-        # Step 1: Student on-policy generation (no grad)
-        # Temporarily enable KV cache and disable gradient checkpointing for fast generation
-        # Under DeepSpeed, model.config is the DS config dict; use unwrapped model for HF config
-        unwrapped = self.accelerator.unwrap_model(model)
-        was_training = model.training
-        prev_use_cache = getattr(unwrapped.config, "use_cache", False)
-        prev_gc = getattr(unwrapped, "is_gradient_checkpointing", False)
-
-        unwrapped.config.use_cache = True
-        if prev_gc and hasattr(unwrapped, "gradient_checkpointing_disable"):
-            unwrapped.gradient_checkpointing_disable()
-        model.eval()
-
-        with torch.no_grad():
-            gen_output = unwrapped.generate(
-                input_ids=kp_input_ids,
-                attention_mask=kp_attention_mask,
-                max_new_tokens=self.finetuning_args.ood_kp_gen_max_new_tokens,
-                temperature=self.finetuning_args.ood_kp_gen_temperature,
-                top_p=self.finetuning_args.ood_kp_gen_top_p,
-                do_sample=True,
-                pad_token_id=self.processing_class.pad_token_id,
-            )
-
-        # Restore training state
-        if was_training:
-            model.train()
-        unwrapped.config.use_cache = prev_use_cache
-        if prev_gc and hasattr(unwrapped, "gradient_checkpointing_enable"):
-            unwrapped.gradient_checkpointing_enable()
-
-        # full_seq = [prompt ; y_gen], shape: [batch, prompt_len + gen_len]
-        full_seq = gen_output
-        full_attention_mask = (full_seq != self.processing_class.pad_token_id).long()
-
-        # gen_mask: 1 for generated token positions, 0 for prompt / padding
-        gen_mask = torch.zeros_like(full_seq, dtype=torch.float)
-        gen_mask[:, prompt_len:] = 1.0
-        gen_mask = gen_mask * full_attention_mask.float()
+        full_seq = kp_batch["input_ids"].to(device)
+        full_attn = kp_batch["attention_mask"].to(device)
+        gen_mask = kp_batch["gen_mask"].to(device).float()
 
         if gen_mask.sum() == 0:
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        # Step 2: Teacher forward (no grad)
+        # Teacher forward (no grad)
         with torch.no_grad():
-            teacher_outputs = self.ref_model(
-                input_ids=full_seq,
-                attention_mask=full_attention_mask,
-            )
-            teacher_logits = teacher_outputs.logits.float()
+            teacher_logits = self.ref_model(
+                input_ids=full_seq, attention_mask=full_attn
+            ).logits.float()
 
-        # Step 3: Student forward (with grad)
-        student_outputs = model(
-            input_ids=full_seq,
-            attention_mask=full_attention_mask,
-        )
-        student_logits = student_outputs.logits.float()
+        # Student forward (with grad)
+        student_logits = model(
+            input_ids=full_seq, attention_mask=full_attn
+        ).logits.float()
 
-        # Step 4: Forward KL on generated tokens (causal LM shift)
-        # logits[:, t] predicts token[:, t+1], so shift accordingly
-        shift_student_logits = student_logits[:, :-1, :].contiguous()
-        shift_teacher_logits = teacher_logits[:, :-1, :].contiguous()
-        shift_gen_mask = gen_mask[:, 1:].contiguous()  # align with predicted tokens
+        # Forward KL on continuation tokens (causal LM shift)
+        shift_student = student_logits[:, :-1, :].contiguous()
+        shift_teacher = teacher_logits[:, :-1, :].contiguous()
+        shift_mask = gen_mask[:, 1:].contiguous()
 
-        # Forward KL: KL(student || teacher) = sum student * (log_student - log_teacher)
-        student_logprobs = F.log_softmax(shift_student_logits, dim=-1)
-        teacher_logprobs = F.log_softmax(shift_teacher_logits, dim=-1)
+        student_logprobs = F.log_softmax(shift_student, dim=-1)
+        teacher_logprobs = F.log_softmax(shift_teacher, dim=-1)
 
-        # F.kl_div(input=teacher_logprobs, target=student_logprobs, log_target=True)
-        #   = exp(student_logprobs) * (student_logprobs - teacher_logprobs)
-        #   = KL(student || teacher) per element
         kl_per_token = F.kl_div(
             teacher_logprobs,
             student_logprobs,
             reduction="none",
             log_target=True,
-        ).sum(dim=-1)  # [batch, seq_len-1]
+        ).sum(dim=-1)
 
-        l_kp = (kl_per_token * shift_gen_mask).sum() / shift_gen_mask.sum()
-        # Compensate for computing KP loss only every N steps:
-        # effective gradient contribution = α * l_kp / N without this, so multiply by N
+        l_kp = (kl_per_token * shift_mask).sum() / shift_mask.sum()
+
+        # α compensation: every_n_steps gating reduces effective α by 1/N, multiply back
         l_kp = l_kp * float(self.finetuning_args.ood_kp_every_n_steps)
         return l_kp
 

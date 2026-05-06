@@ -5,7 +5,7 @@ model_name_or_path: /data1/guest/LlamaFactory/models/Llama-3.1-8B
 stage: sft
 do_train: true
 finetuning_type: full
-deepspeed: examples/deepspeed/ds_z2_config.json
+deepspeed: examples/deepspeed/ds_z3_config.json
 
 ### dataset
 dataset: medmcqa_sft
@@ -33,17 +33,13 @@ bf16: true
 optim: adamw_torch
 seed: 42
 ddp_timeout: 180000000
-gradient_checkpointing: false
-disable_gradient_checkpointing: true
+gradient_checkpointing: true
 
-### OOD Knowledge Preservation (self-distillation)
+### OOD Knowledge Preservation (off-policy on Wikipedia continuations)
 use_ood_kp_loss: true
 ood_kp_alpha: 1.0
 ood_kp_data_path: /data1/guest/LlamaFactory/data/dkp_wiki_10k.jsonl
-ood_kp_gen_max_new_tokens: 32
 ood_kp_every_n_steps: 16
-ood_kp_gen_temperature: 1.0
-ood_kp_gen_top_p: 0.95
 
 ### Teacher model: explicit path + 4-bit quantization to save VRAM
 ref_model: /data1/guest/LlamaFactory/models/Llama-3.1-8B

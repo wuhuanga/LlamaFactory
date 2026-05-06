@@ -60,20 +60,37 @@ def run_sft(
 
     if finetuning_args.use_ood_kp_loss and finetuning_args.ood_kp_data_path is not None:
         logger.info_rank0(f"Loading KP prompts from {finetuning_args.ood_kp_data_path}")
-        prompts = []
+        items = []
         with open(finetuning_args.ood_kp_data_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    prompts.append(json.loads(line)["prompt"])
-        logger.info_rank0(f"Loaded {len(prompts)} KP prompts, tokenizing...")
-        input_ids_list, attention_mask_list = [], []
-        for p in prompts:
-            enc = tokenizer(p, truncation=True, max_length=64, padding=False, return_attention_mask=True)
-            input_ids_list.append(enc["input_ids"])
-            attention_mask_list.append(enc["attention_mask"])
-        kp_dataset = KPPromptDataset(input_ids_list, attention_mask_list)
-        logger.info_rank0(f"KP dataset ready: {len(kp_dataset)} prompts")
+                    obj = json.loads(line)
+                    if "prompt_text" in obj and "continuation_text" in obj:
+                        items.append((obj["prompt_text"], obj["continuation_text"]))
+        logger.info_rank0(f"Loaded {len(items)} KP (prompt, continuation) pairs, tokenizing...")
+
+        input_ids_list, attention_mask_list, gen_mask_list = [], [], []
+        PROMPT_MAX = 64
+        CONT_MAX = 32
+        for prompt_text, cont_text in items:
+            prompt_ids = tokenizer(
+                prompt_text, add_special_tokens=True, truncation=True, max_length=PROMPT_MAX
+            )["input_ids"]
+            cont_ids = tokenizer(
+                cont_text, add_special_tokens=False, truncation=True, max_length=CONT_MAX
+            )["input_ids"]
+            if len(cont_ids) == 0:
+                continue
+            full_ids = prompt_ids + cont_ids
+            attn = [1] * len(full_ids)
+            gen = [0] * len(prompt_ids) + [1] * len(cont_ids)
+            input_ids_list.append(full_ids)
+            attention_mask_list.append(attn)
+            gen_mask_list.append(gen)
+
+        kp_dataset = KPPromptDataset(input_ids_list, attention_mask_list, gen_mask_list)
+        logger.info_rank0(f"KP dataset ready: {len(kp_dataset)} sequences")
 
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction

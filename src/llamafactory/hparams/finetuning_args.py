@@ -534,23 +534,11 @@ class FinetuningArguments(
     )
     ood_kp_data_path: str | None = field(
         default=None,
-        metadata={"help": "Path to the KP prompts JSONL file (each line: {\"prompt\": \"...\"})."},
-    )
-    ood_kp_gen_max_new_tokens: int = field(
-        default=128,
-        metadata={"help": "Max new tokens for on-policy student generation on KP prompts."},
-    )
-    ood_kp_gen_temperature: float = field(
-        default=1.0,
-        metadata={"help": "Temperature for student generation on KP prompts."},
-    )
-    ood_kp_gen_top_p: float = field(
-        default=0.95,
-        metadata={"help": "Top-p for student generation on KP prompts."},
+        metadata={"help": "Path to the KP JSONL file (each line: {\"prompt_text\": \"...\", \"continuation_text\": \"...\"})."},
     )
     ood_kp_every_n_steps: int = field(
-        default=8,
-        metadata={"help": "Compute KP loss every N training steps (to amortize generation cost). Default: every gradient accumulation cycle."},
+        default=16,
+        metadata={"help": "Compute KP loss every N training steps (once per optimizer step)."},
     )
     freeze_vision_tower: bool = field(
         default=True,
